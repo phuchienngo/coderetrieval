@@ -4,7 +4,7 @@ storage:
   cocoindex_metadata_path: /Users/npchien/Documents/Learn/coderetrieval/.data/cocoindex
 
 embedding:
-  model: sentence-transformers/paraphrase-MiniLM-L12-v2
+  model: sentence-transformers/all-MiniLM-L12-v2
   local_dir: /Users/npchien/Documents/Learn/coderetrieval/.models
 
 include_globs:
