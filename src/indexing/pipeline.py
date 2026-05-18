@@ -87,7 +87,8 @@ class IndexingService:
 
     async def run_live(self) -> None:
         self._configure_cocoindex_settings()
-        await self._app.update(live=True)
+        handle = self._app.update(live=True)
+        return await handle.result()
 
     @staticmethod
     async def _resolve_maybe_awaitable(value: object) -> object:
