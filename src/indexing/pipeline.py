@@ -4,8 +4,11 @@ import asyncio
 from dataclasses import dataclass
 from fnmatch import fnmatch
 import inspect
+import logging
 from pathlib import Path
 import os
+import re
+import sqlite3
 from typing import TYPE_CHECKING, Annotated, Iterator
 
 import numpy as np
@@ -28,17 +31,27 @@ _SQLITE_TARGET_DB_PATH: Path | None = None
 _EMBEDDING_MODEL_NAME: str | None = None
 _SQLITE_DB_CTX = coco.ContextKey[coco_sqlite.ManagedConnection]("code_index_sqlite_db")
 _EMBEDDER_CTX = coco.ContextKey[SentenceTransformerEmbedder]("chunk_embedder")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
 class VectorChunkRow:
     id: int
     file_path: str
+    content: str
+    language: str
+    embedding: Annotated[NDArray[np.float32], _EMBEDDER_CTX]
+
+
+@dataclass(slots=True)
+class LexicalChunkRow:
+    id: int
+    file_path: str
     start_line: int
     end_line: int
     content: str
     language: str
-    embedding: Annotated[NDArray[np.float32], _EMBEDDER_CTX]
 
 
 @coco.lifespan
@@ -75,6 +88,24 @@ def _is_included(path: Path, root: Path, includes: list[str], excludes: list[str
     return any(fnmatch(rel, pat) for pat in includes)
 
 
+def _is_low_information_chunk(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return True
+
+    identifiers = _IDENT_RE.findall(stripped)
+    alnum_count = sum(1 for ch in stripped if ch.isalnum())
+    punct_count = sum(1 for ch in stripped if not ch.isalnum() and not ch.isspace())
+
+    if len(stripped) <= 24 and alnum_count <= 2 and punct_count >= 2:
+        return True
+
+    if len(stripped) <= 80 and len(identifiers) <= 1 and punct_count > (alnum_count * 2):
+        return True
+
+    return False
+
+
 class IndexingService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -82,8 +113,12 @@ class IndexingService:
         self._app = self._build_coco_app(app_name="code-retrieval-indexer")
 
     async def prepare_initial_data(self) -> None:
+        logger.info("Index init: starting initial CocoIndex catch-up into chunk_vectors.")
         self._configure_cocoindex_settings()
         await self._app.update(live=False)
+        logger.info("Index init: initial catch-up completed; ensuring FTS schema.")
+        await self._ensure_fts_schema()
+        logger.info("Index init: FTS is ready; indexing database ready for use.")
 
     async def run_live(self) -> None:
         self._configure_cocoindex_settings()
@@ -114,6 +149,7 @@ class IndexingService:
         async def process_file(
             file: FileLike,
             vector_table: "TableTarget[VectorChunkRow]",
+            lexical_table: "TableTarget[LexicalChunkRow]",
         ) -> None:
             file_path = Path(str(file.file_path.path))
             if not file_path.is_absolute():
@@ -133,20 +169,35 @@ class IndexingService:
 
             embedder = coco.use_context(_EMBEDDER_CTX)
             lang = file_path.suffix.lstrip(".").lower() or "text"
-            embeddings = await self._embed_chunks(embedder, chunks)
-            for (start_line, end_line, content), embedding in zip(chunks, embeddings):
+            filtered_chunks = [chunk for chunk in chunks if not _is_low_information_chunk(chunk[2])]
+            if not filtered_chunks:
+                return
+            embeddings = await self._embed_chunks(embedder, filtered_chunks)
+            for (start_line, end_line, content), embedding in zip(filtered_chunks, embeddings):
+                chunk_id = stable_chunk_id(rel, start_line, end_line)
+                # noinspection PyNoneFunctionAssignment
                 declare_result = vector_table.declare_row(
                     row=VectorChunkRow(
-                        id=stable_chunk_id(rel, start_line, end_line, content),
+                        id=chunk_id,
                         file_path=rel,
-                        start_line=start_line,
-                        end_line=end_line,
                         content=content,
                         language=lang,
                         embedding=embedding,
                     )
                 )
+                # noinspection PyNoneFunctionAssignment
+                lexical_result = lexical_table.declare_row(
+                    row=LexicalChunkRow(
+                        id=chunk_id,
+                        file_path=rel,
+                        start_line=start_line,
+                        end_line=end_line,
+                        content=content,
+                        language=lang,
+                    )
+                )
                 await self._resolve_maybe_awaitable(declare_result)
+                await self._resolve_maybe_awaitable(lexical_result)
 
         return process_file
 
@@ -162,6 +213,11 @@ class IndexingService:
                     auxiliary_columns=["file_path", "content"],
                 ),
             )
+            lexical_table = await coco_sqlite.mount_table_target(
+                _SQLITE_DB_CTX,
+                "chunk_lexical",
+                await coco_sqlite.TableSchema.from_class(LexicalChunkRow, primary_key=["id"]),
+            )
             files = localfs.walk_dir(
                 project_path,
                 recursive=True,
@@ -175,6 +231,7 @@ class IndexingService:
                 self._process_file_fn,
                 files.items(),
                 vector_table,
+                lexical_table,
             )
 
         return coco.App(
@@ -192,6 +249,92 @@ class IndexingService:
         _SQLITE_TARGET_DB_PATH = self.config.index_data_path
         _EMBEDDING_MODEL_NAME = self.config.resolved_embedding_model()
         os.environ["COCOINDEX_DB"] = str(self.config.cocoindex_metadata_path)
+
+    async def _ensure_fts_schema(self) -> None:
+        logger.info("FTS init: checking chunk_lexical table and FTS schema.")
+        with sqlite3.connect(self.config.index_data_path) as conn:
+            table_row = conn.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type='table' AND name='chunk_lexical'
+                LIMIT 1
+                """
+            ).fetchone()
+            if table_row is None:
+                raise RuntimeError("chunk_lexical table is missing. Run initial indexing first.")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fts_meta (
+                  k TEXT PRIMARY KEY,
+                  v TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors_fts
+                USING fts5(
+                  file_path,
+                  language,
+                  content,
+                  tokenize='unicode61'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ai
+                AFTER INSERT ON chunk_lexical BEGIN
+                  INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
+                  VALUES (new.id, new.file_path, new.language, new.content);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ad
+                AFTER DELETE ON chunk_lexical BEGIN
+                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, language, content)
+                  VALUES('delete', old.id, old.file_path, old.language, old.content);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_au
+                AFTER UPDATE ON chunk_lexical BEGIN
+                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, language, content)
+                  VALUES('delete', old.id, old.file_path, old.language, old.content);
+                  INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
+                  VALUES (new.id, new.file_path, new.language, new.content);
+                END
+                """
+            )
+            flag_row = conn.execute(
+                "SELECT v FROM fts_meta WHERE k = 'chunk_vectors_fts_backfilled' LIMIT 1"
+            ).fetchone()
+            if flag_row is None:
+                logger.info("FTS init: seeding chunk_vectors_fts from chunk_lexical snapshot.")
+                conn.execute("DELETE FROM chunk_vectors_fts")
+                conn.execute(
+                    """
+                    INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
+                    SELECT id, file_path, language, content
+                    FROM chunk_lexical
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO fts_meta(k, v)
+                    VALUES('chunk_vectors_fts_backfilled', '1')
+                    ON CONFLICT(k) DO UPDATE SET v = excluded.v
+                    """
+                )
+                logger.info("FTS init: seed completed and marked as backfilled.")
+            else:
+                logger.info("FTS init: seed already done; using existing chunk_vectors_fts.")
+            conn.commit()
 
     def _source_excluded_patterns(self) -> list[str]:
         patterns = list(self.config.exclude_globs)

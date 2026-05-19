@@ -19,10 +19,11 @@ def run() -> None:
     indexing_service = IndexingService(config)
     scheduler = IndexScheduler(indexing_service)
     scheduler.start()
-    logging.info("Initial indexing catch-up completed. Starting MCP server.")
+    logging.info("Startup: indexing initialized and FTS ready; starting MCP server.")
 
     mcp = build_mcp_server(RetrievalService(config))
     try:
+        logging.info("Startup: MCP server ready for queries at http://%s:%s/mcp", config.host, config.port)
         mcp.run(transport="streamable-http", host=config.host, port=config.port, path="/mcp")
     finally:
         scheduler.stop()

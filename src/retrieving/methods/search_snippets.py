@@ -10,6 +10,8 @@ from src.retrieving.types import SQLParam, SearchCodeResult
 
 logger = logging.getLogger(__name__)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_:.#/\\-]+")
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_WORD_RE = re.compile(r"[^a-z0-9]+")
 
 
 class _ScoredRow(TypedDict):
@@ -19,6 +21,24 @@ class _ScoredRow(TypedDict):
     snippet: str
     semantic_score: float
     lexical_score: float
+
+
+_RRF_K = 60.0
+
+
+def _normalize_for_fts(text: str) -> str:
+    out: list[str] = []
+    for raw in _TOKEN_RE.findall(text):
+        token = raw.strip()
+        if not token:
+            continue
+        split = _CAMEL_BOUNDARY_RE.sub(" ", token).replace("_", " ")
+        parts = [p.lower() for p in _NON_WORD_RE.split(split.lower()) if p]
+        out.extend(parts)
+        compact = _NON_WORD_RE.sub("", token.lower())
+        if compact and compact not in parts:
+            out.append(compact)
+    return " ".join(out)
 
 
 def search_snippets(
@@ -44,7 +64,6 @@ def search_snippets(
         language=language,
     )
     return _merge_ranked(
-        query=query,
         top_k=effective_top_k,
         semantic_rows=semantic_rows,
         lexical_rows=lexical_rows,
@@ -63,17 +82,19 @@ def _vector_search(
     except RuntimeError:
         return []
     sql = (
-        "SELECT file_path, start_line, end_line, content, distance "
-        "FROM chunk_vectors WHERE embedding MATCH ? AND k = ?"
+        "SELECT l.file_path, l.start_line, l.end_line, l.content, v.distance "
+        "FROM chunk_vectors v "
+        "JOIN chunk_lexical l ON l.id = v.id "
+        "WHERE v.embedding MATCH ? AND v.k = ?"
     )
     args: list[SQLParam] = [query_vec, top_k]
     if path_filter:
-        sql += " AND file_path LIKE ?"
+        sql += " AND l.file_path LIKE ?"
         args.append(f"%{path_filter}%")
     if language:
-        sql += " AND language = ?"
+        sql += " AND l.language = ?"
         args.append(language.lower())
-    sql += " ORDER BY distance"
+    sql += " ORDER BY v.distance"
     try:
         with service._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
@@ -102,18 +123,24 @@ def _lexical_search(
 ) -> list[SearchCodeResult]:
     if not query.strip():
         return []
+    tokens = [t for t in _normalize_for_fts(query).split() if t]
+    if not tokens:
+        return []
+    match_expr = " OR ".join(f'"{tok}"' for tok in tokens)
     sql = (
-        "SELECT file_path, start_line, end_line, content "
-        "FROM chunk_vectors WHERE content LIKE ?"
+        "SELECT c.file_path, c.start_line, c.end_line, c.content, bm25(chunk_vectors_fts) AS lexical_rank "
+        "FROM chunk_vectors_fts "
+        "JOIN chunk_lexical c ON c.id = chunk_vectors_fts.rowid "
+        "WHERE chunk_vectors_fts MATCH ?"
     )
-    args: list[SQLParam] = [f"%{query}%"]
+    args: list[SQLParam] = [match_expr]
     if path_filter:
-        sql += " AND file_path LIKE ?"
+        sql += " AND c.file_path LIKE ?"
         args.append(f"%{path_filter}%")
     if language:
-        sql += " AND language = ?"
+        sql += " AND c.language = ?"
         args.append(language.lower())
-    sql += " ORDER BY start_line LIMIT ?"
+    sql += " ORDER BY lexical_rank LIMIT ?"
     args.append(top_k)
     try:
         with service._conn() as conn:
@@ -128,37 +155,33 @@ def _lexical_search(
             "start_line": r["start_line"],
             "end_line": r["end_line"],
             "snippet": r["content"],
-            "score": _lexical_score(query=query, snippet=str(r["content"])),
+            "score": float(1.0 / (1.0 + idx)),
         }
-        for r in rows
+        for idx, r in enumerate(rows)
     ]
 
 
 def _merge_ranked(
-    query: str,
     top_k: int,
     semantic_rows: list[SearchCodeResult],
     lexical_rows: list[SearchCodeResult],
 ) -> list[SearchCodeResult]:
     merged: dict[tuple[str, int, int], _ScoredRow] = {}
-    is_code_like = _is_code_like_query(query)
-    semantic_weight = 0.45 if is_code_like else 0.75
-    lexical_weight = 1.0 - semantic_weight
-
-    for row in semantic_rows:
+    for rank, row in enumerate(semantic_rows, start=1):
         key = (row["file_path"], row["start_line"], row["end_line"])
         merged[key] = {
             "file_path": row["file_path"],
             "start_line": row["start_line"],
             "end_line": row["end_line"],
             "snippet": row["snippet"],
-            "semantic_score": row["score"],
+            "semantic_score": 1.0 / (_RRF_K + rank),
             "lexical_score": 0.0,
         }
 
-    for row in lexical_rows:
+    for rank, row in enumerate(lexical_rows, start=1):
         key = (row["file_path"], row["start_line"], row["end_line"])
         existing = merged.get(key)
+        rrf = 1.0 / (_RRF_K + rank)
         if existing is None:
             merged[key] = {
                 "file_path": row["file_path"],
@@ -166,14 +189,14 @@ def _merge_ranked(
                 "end_line": row["end_line"],
                 "snippet": row["snippet"],
                 "semantic_score": 0.0,
-                "lexical_score": row["score"],
+                "lexical_score": rrf,
             }
         else:
-            existing["lexical_score"] = max(existing["lexical_score"], row["score"])
+            existing["lexical_score"] = rrf
 
     ranked = sorted(
         merged.values(),
-        key=lambda item: (semantic_weight * item["semantic_score"]) + (lexical_weight * item["lexical_score"]),
+        key=lambda item: item["semantic_score"] + item["lexical_score"],
         reverse=True,
     )
     return [
@@ -182,38 +205,7 @@ def _merge_ranked(
             "start_line": row["start_line"],
             "end_line": row["end_line"],
             "snippet": row["snippet"],
-            "score": (semantic_weight * row["semantic_score"]) + (lexical_weight * row["lexical_score"]),
+            "score": row["semantic_score"] + row["lexical_score"],
         }
         for row in ranked[:top_k]
     ]
-
-
-def _lexical_score(query: str, snippet: str) -> float:
-    query_norm = query.strip().lower()
-    snippet_norm = snippet.lower()
-    if not query_norm:
-        return 0.0
-    if query_norm == snippet_norm:
-        return 1.0
-    if query_norm in snippet_norm:
-        base = 0.7
-    else:
-        base = 0.0
-    query_tokens = [t.lower() for t in _TOKEN_RE.findall(query) if t]
-    if not query_tokens:
-        return base
-    token_hits = sum(1 for tok in query_tokens if tok in snippet_norm)
-    token_score = token_hits / len(query_tokens)
-    return min(1.0, base + (0.3 * token_score))
-
-
-def _is_code_like_query(query: str) -> bool:
-    stripped = query.strip()
-    if not stripped:
-        return False
-    if any(marker in stripped for marker in ("::", "->", ".", "(", ")", "{", "}", "::class")):
-        return True
-    tokens = _TOKEN_RE.findall(stripped)
-    if 0 < len(tokens) <= 3 and any(any(ch.isupper() for ch in t) for t in tokens):
-        return True
-    return False
