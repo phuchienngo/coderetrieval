@@ -278,7 +278,7 @@ class IndexingService:
                   file_path,
                   language,
                   content,
-                  tokenize='unicode61'
+                  tokenize='trigram'
                 )
                 """
             )
