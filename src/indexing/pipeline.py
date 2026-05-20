@@ -88,6 +88,16 @@ def _is_included(path: Path, root: Path, includes: list[str], excludes: list[str
     return any(fnmatch(rel, pat) for pat in includes)
 
 
+def _to_project_relative(path: Path, root: Path) -> str | None:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        rel = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return rel.as_posix()
+
+
 def _is_low_information_chunk(content: str) -> bool:
     stripped = content.strip()
     if not stripped:
@@ -154,8 +164,11 @@ class IndexingService:
             file_path = Path(str(file.file_path.path))
             if not file_path.is_absolute():
                 file_path = (self.config.project_path / file_path).resolve()
+            rel = _to_project_relative(file_path, self.config.project_path)
+            if rel is None:
+                return
             if not _is_included(
-                file_path,
+                self.config.project_path / rel,
                 self.config.project_path,
                 self.config.include_globs,
                 self.config.exclude_globs,
@@ -163,7 +176,6 @@ class IndexingService:
                 return
 
             text = await file.read_text()
-            rel = str(file_path.relative_to(self.config.project_path))
             lines = text.splitlines(keepends=True)
             chunks = _chunk_lines(lines, self.config.chunk_size, self.config.chunk_overlap)
 
