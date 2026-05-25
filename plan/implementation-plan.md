@@ -3,29 +3,28 @@
 ## 1. Scope and Goals
 
 Build a Python project that:
-- Accepts a target project path and indexes source code into SQLite using CocoIndex.
+- Accepts a target project path and indexes source code into PostgreSQL using CocoIndex.
 - Uses vector search as the primary retrieval path.
-- Exposes an MCP server interface with 2 tools:
+- Exposes an MCP server interface with 1 tool:
   - `search_snippets`
-  - `find_related_snippets`
 
 ## 2. High-Level Architecture
 
 1. Configuration Layer
 - Centralized config model loaded from YAML.
 - Core groups:
-  - `storage` (`index_data_path`, `cocoindex_metadata_path`)
+  - `storage` (`postgres_dsn`, `cocoindex_metadata_path`)
   - `embedding` (`model`, `local_dir`)
 
 2. Indexing Component (CocoIndex)
 - File discovery/filtering.
 - Chunking + embedding.
-- Persist vectorized chunks into SQLite vec tables managed by CocoIndex.
+- Persist vectorized chunks into PostgreSQL pgvector tables managed by CocoIndex.
 - Run in live mode for continuous updates.
 
 3. Retrieval Component
-- Query handlers for semantic search and related-code search.
-- SQLite access abstraction in retrieval service.
+- Query handler for hybrid semantic + lexical search.
+- PostgreSQL access abstraction in retrieval service.
 
 4. MCP Transport Component
 - Python MCP server over Streamable HTTP (`/mcp`).
@@ -47,7 +46,7 @@ project_path: /path/to/repo
 host: 127.0.0.1
 port: 8000
 storage:
-  index_data_path: /path/to/.data/code_index.db
+  postgres_dsn: postgresql://coderetrieval:coderetrieval@127.0.0.1:5432/coderetrieval
   cocoindex_metadata_path: /path/to/.data/cocoindex
 embedding:
   model: sentence-transformers/all-MiniLM-L12-v2
@@ -68,19 +67,25 @@ Validation rules:
 
 ## 4. Data Model (Current)
 
-Vector retrieval is backed by CocoIndex-managed SQLite vec tables.
+Vector retrieval is backed by CocoIndex-managed PostgreSQL pgvector tables.
 
 Primary logical table:
 - `chunk_vectors`
+  - `id`
+  - `file_path`
+  - `content`
+  - `file_extension`
+  - `embedding`
+- `chunk_lexical`
+  - `id`
   - `file_path`
   - `start_line`
   - `end_line`
   - `content`
-  - `language`
-  - `embedding`
+  - `file_extension`
 
 Notes:
-- Virtual tables are expected for vec support.
+- pgvector extension is required for vector support.
 - CocoIndex manages incremental updates and changed/deleted files.
 
 ## 5. Retrieval Method Specifications
@@ -94,7 +99,7 @@ Input:
 - `query: str` (required)
 - `top_k: int = 0` (`0` means omitted, use service default)
 - `path_filter: str = ""` (`""` means omitted)
-- `language: str = ""` (`""` means omitted)
+- `file_extension: str = ""` (`""` means omitted)
 
 Execution:
 1. Embed query text.
@@ -105,44 +110,21 @@ Execution:
 Output fields:
 - `file_path`, `start_line`, `end_line`, `snippet`, `score`
 
-## 5.2 `find_related_snippets`
-
-Purpose:
-- Retrieve semantically related code from a symbol seed or file+line anchor.
-
-Input:
-- `symbol: str = ""` (`""` means omitted)
-- `file_path: str = ""` (`""` means omitted)
-- `line: int = 0` (`0` means omitted)
-- `top_k: int = 20`
-
-Execution:
-1. Resolve seed query text from `symbol` or anchored chunk content.
-2. Embed seed text.
-3. KNN vector search.
-4. Return nearest snippets with relation metadata.
-
-Output fields:
-- `relation_type`, `file_path`, `start_line`, `end_line`, `snippet`, `score`
-
 ## 6. MCP Server Plan (Python, Streamable HTTP)
 
 ## 6.1 Server Structure
 
 - `src/serving/mcp_http_server.py` for MCP bootstrap.
 - `src/retrieving/tools/search_snippets.py` tool handler.
-- `src/retrieving/tools/find_related_snippets.py` tool handler.
 - `src/retrieving/service.py` shared query and embedding logic.
 
 ## 6.2 MCP Tool Contracts (Current)
 
-- `search_snippets(query, top_k=0, path_filter="", language="")`
-- `find_related_snippets(symbol="", file_path="", line=0, top_k=20)`
+- `search_snippets(query, top_k=0, path_filter="", file_extension="")`
 
 Normalization behavior:
 - `top_k <= 0` -> internal `None` (use default)
 - empty strings -> internal `None`
-- `line <= 0` -> internal `None`
 
 ## 7. Project Structure (Current)
 
@@ -163,10 +145,8 @@ coderetrieval/
       service.py
       methods/
         search_snippets.py
-        find_related_snippets.py
       tools/
         search_snippets.py
-        find_related_snippets.py
     serving/
       mcp_http_server.py
   config.yaml
@@ -179,15 +159,12 @@ Manual smoke flow:
 1. Start with `./scripts/start_server.sh config.yaml`.
 2. Confirm initial indexing catch-up completes.
 3. Confirm MCP server is reachable at `http://127.0.0.1:8000/mcp`.
-4. Call each tool once:
+4. Call the tool once:
   - `search_snippets`
-  - `find_related_snippets`
 
 ## 9. Definition of Done (Current)
 
 - YAML config loads and validates with grouped `storage` and `embedding` fields.
 - CocoIndex live indexing runs successfully.
-- MCP server exposes and serves:
-  - `search_snippets`
-  - `find_related_snippets`
+- MCP server exposes and serves `search_snippets`.
 - Startup script can prepare model and boot service end-to-end.

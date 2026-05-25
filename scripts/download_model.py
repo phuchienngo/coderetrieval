@@ -2,36 +2,31 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
-import yaml
 from sentence_transformers import SentenceTransformer
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from src.config import load_config
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download embedding model from config.")
-    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--config", default="sample.config.yaml")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    root = Path(__file__).resolve().parent.parent
     config_path = Path(args.config)
     if not config_path.is_absolute():
-        config_path = (root / config_path).resolve()
-    with config_path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError(f"YAML config must be a mapping: {config_path}")
+        config_path = (ROOT_DIR / config_path).resolve()
+    cfg = load_config(["--config", str(config_path)])
 
-    embedding_cfg = cfg.get("embedding", {}) if isinstance(cfg.get("embedding"), dict) else {}
-    model_name = str(
-        embedding_cfg.get("model")
-        or cfg.get("embedding_model")
-        or "sentence-transformers/all-MiniLM-L6-v2"
-    )
-    local_root = embedding_cfg.get("local_dir") or cfg.get("embedding_model_local_dir")
-    local_root_path = (Path(str(local_root)).expanduser() if local_root else (root / ".models")).resolve()
+    model_name = cfg.embedding_model
+    local_root_path = cfg.embedding_model_local_dir
     local_model_dir = local_root_path / model_name.split("/")[-1]
     local_model_dir.mkdir(parents=True, exist_ok=True)
 
