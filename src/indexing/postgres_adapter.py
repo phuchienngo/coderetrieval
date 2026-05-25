@@ -1,26 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
-from pathlib import Path
+from typing import Any
 
-import sqlite_vec
+import psycopg
+from psycopg.rows import dict_row
 
 
-class CocoIndexSQLiteAdapter:
-    def __init__(self, db_path: Path, extension_path: str | None = None) -> None:
-        self.db_path = db_path
-        self.extension_path = extension_path
+class CocoIndexPostgresAdapter:
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        if self.extension_path:
-            conn.load_extension(self.extension_path)
-        conn.enable_load_extension(False)
-        return conn
+    def connect(self) -> psycopg.Connection[dict[str, Any]]:
+        return psycopg.connect(self.dsn, row_factory=dict_row)
 
     def run_smoke_flow(self) -> dict[str, str]:
         sample_key = "__cocoindex_smoke__"
@@ -28,6 +20,7 @@ class CocoIndexSQLiteAdapter:
         sample_hash = self.file_hash(sample_content)
 
         with self.connect() as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS __smoke_probe__ (
@@ -37,35 +30,34 @@ class CocoIndexSQLiteAdapter:
                 )
                 """
             )
-            conn.execute("DELETE FROM __smoke_probe__ WHERE k = ?", (sample_key,))
+            conn.execute("DELETE FROM __smoke_probe__ WHERE k = %s", (sample_key,))
             conn.execute(
                 """
                 INSERT INTO __smoke_probe__(k, h, c)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 """,
                 (sample_key, sample_hash, sample_content),
             )
-            conn.commit()
 
             row = conn.execute(
                 """
                 SELECT k, h, c
                 FROM __smoke_probe__
-                WHERE k = ?
+                WHERE k = %s
                 LIMIT 1
                 """,
                 (sample_key,),
             ).fetchone()
 
-            conn.execute("DELETE FROM __smoke_probe__ WHERE k = ?", (sample_key,))
+            conn.execute("DELETE FROM __smoke_probe__ WHERE k = %s", (sample_key,))
             conn.commit()
 
         if row is None:
-            raise RuntimeError("CocoIndex smoke flow failed: sample record was not readable.")
+            raise RuntimeError("Postgres smoke flow failed: sample record was not readable.")
         if row["h"] != sample_hash:
-            raise RuntimeError("CocoIndex smoke flow failed: hash mismatch.")
+            raise RuntimeError("Postgres smoke flow failed: hash mismatch.")
         if row["c"] != sample_content:
-            raise RuntimeError("CocoIndex smoke flow failed: content mismatch.")
+            raise RuntimeError("Postgres smoke flow failed: content mismatch.")
 
         return {"file_path": row["k"], "hash": row["h"]}
 

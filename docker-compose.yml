@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: ${CODERETRIEVAL_POSTGRES_IMAGE}
+    container_name: ${CODERETRIEVAL_POSTGRES_CONTAINER}
+    environment:
+      POSTGRES_USER: ${CODERETRIEVAL_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${CODERETRIEVAL_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${CODERETRIEVAL_POSTGRES_DB}
+    ports:
+      - "${CODERETRIEVAL_POSTGRES_PORT}:5432"
+    volumes:
+      - ${CODERETRIEVAL_POSTGRES_DATA_DIR}:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30

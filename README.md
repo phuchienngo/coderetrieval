@@ -1,203 +1,311 @@
 # CodeRetrieval
 
-CodeRetrieval là dịch vụ index code local và expose MCP tool để search snippet theo semantic + lexical.
+CodeRetrieval index source code local project and exposes an MCP tool for hybrid code snippet search.
 
-Hiện tại hệ thống có 2 phần chính:
-- `indexing`: đọc source code, chunk, embedding, lưu vào SQLite.
-- `retrieving/serving`: nhận query, chạy hybrid search và trả kết quả qua MCP HTTP server.
+Current storage is PostgreSQL only:
+- Semantic index: `chunk_vectors.embedding` with pgvector HNSW index.
+- Lexical index: `chunk_lexical.content_search` as PostgreSQL `tsvector` with GIN index.
+- CocoIndex metadata: local directory at `storage.cocoindex_metadata_path`.
 
-## 1. Tổng quan kiến trúc
+## Runtime Flow
 
-- Dữ liệu index chính: `chunk_vectors` cho semantic/vector và `chunk_lexical` cho metadata/snippet.
-- Chỉ mục lexical: bảng FTS5 `chunk_vectors_fts`.
-- Vector search: `sqlite-vec` trên cột `embedding`.
-- Service API: MCP tool `search_snippets`.
+1. `scripts/start_server.sh` starts Docker PostgreSQL with pgvector support.
+2. App loads the config passed to the start script.
+3. Smoke flow verifies PostgreSQL connectivity and `vector` extension.
+4. CocoIndex catch-up scans the project and declares target rows.
+5. App ensures lexical search schema on `chunk_lexical`.
+6. Live indexing starts to keep rows updated from file changes.
+7. MCP HTTP server starts at `/mcp`.
 
-Luồng runtime:
-1. Start app -> load config.
-2. Chạy smoke flow để kiểm tra DB extension.
-3. Chạy indexing catch-up (1 lượt toàn bộ/đổi mới).
-4. Bật live indexing (theo thay đổi file).
-5. Start MCP server tại `/mcp`.
+## Docker PostgreSQL
 
-## 2. Cách data được index bằng CocoIndex
+PostgreSQL is defined in `docker-compose.yml`.
 
-Mã chính: `src/indexing/pipeline.py`
+Start server with Docker Compose and `test.config.yaml`:
 
-### 2.1. File discovery và filter
+```bash
+./scripts/start_server.sh test.config.yaml
+```
 
-Nguồn file dùng `localfs.walk_dir(...)` của CocoIndex:
+`start_server.sh` starts PostgreSQL with Docker Compose, syncs local dependencies, downloads the configured model if missing, and then starts the app. Pass another config path as the first argument if needed.
+
+Start PostgreSQL only:
+
+```bash
+./scripts/start_postgres.sh
+```
+
+Stop PostgreSQL container:
+
+```bash
+./scripts/stop_postgres.sh
+```
+
+Remove the persisted PostgreSQL data directory while stopping:
+
+```bash
+REMOVE_DATA=1 ./scripts/stop_postgres.sh
+```
+
+Default Docker settings:
+- container: `coderetrieval-postgres`
+- image: `pgvector/pgvector:pg16`
+- database: `coderetrieval`
+- user/password: `coderetrieval` / `coderetrieval`
+- port: `127.0.0.1:5432`
+- data directory: `./.data/postgres`
+
+Override these with env vars:
+- `CODERETRIEVAL_POSTGRES_CONTAINER`
+- `CODERETRIEVAL_POSTGRES_IMAGE`
+- `CODERETRIEVAL_POSTGRES_USER`
+- `CODERETRIEVAL_POSTGRES_PASSWORD`
+- `CODERETRIEVAL_POSTGRES_DB`
+- `CODERETRIEVAL_POSTGRES_PORT`
+- `CODERETRIEVAL_POSTGRES_DATA_DIR`
+
+## Config
+
+Main config keys:
+
+```yaml
+project_path: /path/to/project
+storage:
+  postgres_dsn: postgresql://coderetrieval:coderetrieval@127.0.0.1:5432/coderetrieval
+  cocoindex_metadata_path: /path/to/.data/cocoindex
+embedding:
+  model: sentence-transformers/all-MiniLM-L12-v2
+  local_dir: /path/to/.models
+include_globs:
+  - "**/*.kt"
+  - "**/*.java"
+exclude_globs:
+  - "**/.git/**"
+chunk_size: 120
+chunk_overlap: 20
+top_k_default: 20
+host: 127.0.0.1
+port: 8000
+```
+
+Config files support environment variable binding before YAML parsing:
+
+```yaml
+project_path: ${CODE_RETRIEVAL_PROJECT_PATH}
+storage:
+  postgres_dsn: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+  cocoindex_metadata_path: ${CODE_RETRIEVAL_HOME}/.data/cocoindex
+embedding:
+  model: sentence-transformers/all-MiniLM-L12-v2
+  local_dir: ${CODE_RETRIEVAL_HOME}/.models
+```
+
+Unset referenced variables fail startup with a clear config error.
+
+## Indexing Pipeline
+
+Main code: `src/indexing/pipeline.py`.
+
+CocoIndex owns incremental file discovery and row synchronization. The pipeline declares the desired target state from the current source tree; CocoIndex decides which files/chunks changed and applies insert/update/delete to PostgreSQL.
+
+### File Discovery
+
+`localfs.walk_dir(...)` scans `project_path` with:
 - `recursive=True`
 - `live=True`
-- include patterns: `config.include_globs`
-- exclude patterns: `config.exclude_globs` + một số pattern bảo vệ DB transient file (`*.db-wal`, `*.db-shm`, ...)
+- `include_globs` from config
+- `exclude_globs` from config plus the CocoIndex metadata directory if it is inside the indexed project
 
-Ngoài matcher của `walk_dir`, service còn kiểm tra lại bằng `_is_included(...)` trước khi xử lý file.
+Each file is checked again by `_is_included(...)` before processing.
 
-### 2.2. Chunking
+### Chunking
 
-Mỗi file được:
-1. đọc text
-2. tách theo dòng
-3. chunk bằng `_chunk_lines(...)` với:
-- `chunk_size`
-- `chunk_overlap`
+Files are split by lines using `_chunk_lines(...)`:
+- `chunk_size` is the max number of lines per chunk.
+- `chunk_overlap` is the line overlap between adjacent chunks.
+- `step = chunk_size - chunk_overlap`.
 
-Chunk là sliding window theo dòng:
-- `step = chunk_size - chunk_overlap`
-- mỗi chunk giữ `(start_line, end_line, content)`.
+Each chunk has:
+- `start_line`
+- `end_line`
+- `content`
 
-### 2.3. Embedding
+Low-information chunks are skipped. This avoids indexing Kotlin/Java tail chunks that contain mostly closing braces, for example `}\n}\n`.
 
-Mỗi `content` chunk được embed bằng `SentenceTransformerEmbedder` (CocoIndex op context).
+### Stable IDs
 
-Model lấy từ config:
-- `embedding.model`
-- nếu có `embedding.local_dir` thì resolve model local path.
+Chunk id is generated from:
+- project-relative `file_path`
+- `start_line`
+- `end_line`
 
-### 2.4. Persist vào `chunk_vectors` và `chunk_lexical`
+The id intentionally does not include content. If content changes at the same location, CocoIndex can update the existing row instead of treating it as a new identity.
 
-Hai bảng đều được mount qua `coco_sqlite.mount_table_target(...)`.
+### Embedding
 
-`chunk_vectors` là vec0 table cho semantic search:
-- `id`: stable hash từ `(file_path, start_line, end_line)`
+Each retained chunk is embedded with `SentenceTransformerEmbedder` from CocoIndex context. The same local model is used later by retrieval to embed the query.
+
+### PostgreSQL Tables
+
+CocoIndex mounts two PostgreSQL target tables.
+
+`chunk_vectors`:
+- `id` primary key
 - `file_path`
 - `content`
 - `file_extension`
-- `embedding`
+- `embedding vector`
 
-`file_extension` là partition key. `file_path` và `content` là auxiliary columns trên vec table.
+Purpose:
+- pgvector semantic search
+- cheap filtering by `file_path` and `file_extension` before vector ordering
 
-`chunk_lexical` là table thường cho metadata và lexical search:
-- `id`
+`chunk_lexical`:
+- `id` primary key
 - `file_path`
 - `start_line`
 - `end_line`
 - `content`
 - `file_extension`
+- `content_search tsvector` added by app schema setup
 
-`id` ổn định giúp CocoIndex update row theo identity của chunk.
+Purpose:
+- snippet metadata
+- PostgreSQL lexical search
 
-### 2.5. FTS schema và incremental sync
+`content_search` is not declared in the CocoIndex dataclass because it is derived database-side from `file_path` and `content`.
 
-Trong `IndexingService._ensure_fts_schema()`:
-- tạo `chunk_vectors_fts` (FTS5) nếu chưa có.
-- tạo 3 trigger sync tự động từ `chunk_lexical` -> `chunk_vectors_fts`:
-1. `AFTER INSERT`
-2. `AFTER UPDATE`
-3. `AFTER DELETE`
+### Lexical Schema Setup
 
-Ý nghĩa:
-- Khi live indexing thêm/sửa/xóa chunk trong `chunk_lexical`, chỉ mục lexical FTS5 tự cập nhật incremental.
-- Sau lần catch-up đầu tiên, hệ thống backfill snapshot từ `chunk_lexical` sang `chunk_vectors_fts` đúng 1 lần.
-- Sau đó không cần rebuild định kỳ; trigger lo incremental update.
+After the CocoIndex catch-up creates/syncs `chunk_lexical`, `_ensure_fts_schema()`:
+- creates metadata table `fts_meta`
+- adds `chunk_lexical.content_search tsvector` if missing
+- creates trigger function `chunk_lexical_content_search_update()`
+- creates trigger `chunk_lexical_content_search_tsv`
+- creates GIN index `chunk_lexical_content_search_idx`
+- backfills rows where `content_search IS NULL`
 
-## 3. Chiến lược query chi tiết
+The trigger keeps `content_search` incremental for later insert/update operations. Startup backfill is idempotent, so recreated rows with missing `content_search` are repaired without requiring a full database reset.
 
-Mã chính: `src/retrieving/methods/search_snippets.py`
+Delete does not need a trigger because `content_search` is a column on the deleted row, not a separate table.
 
-Query là hybrid gồm 2 nhánh độc lập, sau đó merge bằng RRF.
+## Query Strategy
 
-### 3.1. Nhánh semantic (vector search)
+Main code: `src/retrieving/methods/search_snippets.py`.
 
-1. Embed query text bằng cùng model (SentenceTransformer).
-2. Query SQLite vec table:
-- `FROM chunk_vectors`
-- `WHERE embedding MATCH ? AND k = ?`
-- optional filter:
-  - `file_path LIKE %path_filter%`
-  - `file_extension = ?`
-- sort `ORDER BY distance`
-3. Chuyển distance sang score:
-- `semantic_score = 1 / (1 + distance)`
+Search is hybrid:
+- vector branch for semantic similarity
+- lexical branch for exact/token-style matching
+- RRF merges both ranked lists
 
-### 3.2. Nhánh lexical (FTS5 search)
+### Vector Branch
 
-1. Tạo token query bằng `_tokens_for_fts(...)`:
-- tách camelCase
-- tách snake_case
-- lower-case
-- thêm token compact
-2. Bỏ token ngắn hơn 3 ký tự vì FTS đang dùng tokenizer `trigram`.
-3. Build FTS expression dạng OR token.
-4. Query:
-- `FROM chunk_vectors_fts`
-- `JOIN chunk_lexical ON chunk_lexical.id = chunk_vectors_fts.rowid`
-- `WHERE chunk_vectors_fts MATCH ?`
-- optional filter theo `path_filter`, `file_extension`
-- `ORDER BY bm25(chunk_vectors_fts)`
-5. Đổi rank lexical thành điểm đơn điệu theo vị trí:
-- `lexical_rank_score = 1 / (1 + rank_index)`
+1. Embed the query with the same SentenceTransformer model.
+2. Query PostgreSQL:
 
-### 3.3. Merge semantic + lexical bằng RRF
-
-Project dùng Reciprocal Rank Fusion:
-- hằng số `K = 60`
-- với mỗi kết quả:
-  - nếu có trong semantic list: cộng `1 / (K + rank_semantic)`
-  - nếu có trong lexical list: cộng `1 / (K + rank_lexical)`
-- score cuối = tổng 2 phần.
-
-Key dedupe result:
-- `(file_path, start_line, end_line)`
-
-Sau merge:
-- sort giảm dần theo RRF score
-- trả `top_k`.
-
-Lợi ích RRF so với weighted score thô:
-- không phụ thuộc scale điểm semantic vs lexical.
-- kết quả xuất hiện ở cả 2 nhánh sẽ tự nhiên được boost.
-
-## 4. MCP interface
-
-Mã: `src/serving/mcp_http_server.py`
-
-Hiện chỉ expose 1 tool:
-- `search_snippets(query, top_k, path_filter, file_extension)`
-
-Response:
-- danh sách snippet gồm:
-  - `file_path`
-  - `start_line`
-  - `end_line`
-  - `snippet`
-  - `score`
-
-## 5. Cấu hình chính
-
-File: `config.yaml`
-
-Các key quan trọng:
-- `project_path`: repo cần index
-- `storage.index_data_path`: file SQLite index
-- `storage.cocoindex_metadata_path`: metadata path cho CocoIndex
-- `embedding.model`: tên model
-- `embedding.local_dir`: thư mục model local
-- `include_globs`, `exclude_globs`
-- `chunk_size`, `chunk_overlap`
-- `top_k_default`
-- `host`, `port`
-
-## 6. Cách chạy
-
-```bash
-./scripts/start_server.sh config.yaml
+```sql
+SELECT l.file_path, l.start_line, l.end_line, l.content,
+       (v.embedding <=> $query_vector::vector) AS distance
+FROM chunk_vectors v
+JOIN chunk_lexical l ON l.id = v.id
+WHERE true
+  -- optional path/file_extension filters
+ORDER BY v.embedding <=> $query_vector::vector
+LIMIT $top_k
 ```
 
-Script sẽ:
-1. sync dependency (uv nếu có)
-2. tải model local nếu chưa có
-3. chạy app (`main.py`)
+`<=>` is pgvector cosine distance. Smaller distance means more similar.
 
-## 7. Trade-off hiện tại
+For display/debug score only, distance is converted as:
 
-Ưu điểm:
-- stack nhẹ (SQLite + CocoIndex + sentence-transformers)
-- incremental live indexing
-- hybrid retrieval với RRF
+```text
+score = 1 / (1 + distance)
+```
 
-Giới hạn:
-- chunking hiện là line-window, chưa semantic-aware theo AST
-- lexical tokenizer hiện custom nhẹ, chưa mạnh như pipeline parser chuyên sâu
-- chưa có query cache / multi-index / context expansion
+This score is monotonic: lower distance produces higher score. The final hybrid ranking does not depend on this raw score; it uses result order through RRF.
+
+### Lexical Branch
+
+1. `_tokens_for_fts(query)` extracts code-ish tokens:
+- keeps path/code punctuation during the first pass
+- splits camelCase
+- splits snake_case and punctuation
+- lowercases tokens
+- adds compact form such as `fooBar` -> `foobar`
+- removes duplicates
+- drops tokens shorter than 3 chars
+
+2. Tokens are joined with OR into a PostgreSQL `to_tsquery('simple', ...)` expression.
+
+3. Query PostgreSQL:
+
+```sql
+SELECT c.file_path, c.start_line, c.end_line, c.content,
+       ts_rank_cd(c.content_search, to_tsquery('simple', $query)) AS lexical_rank
+FROM chunk_lexical c
+WHERE c.content_search @@ to_tsquery('simple', $query)
+  -- optional path/file_extension filters
+ORDER BY lexical_rank DESC
+LIMIT $top_k
+```
+
+`simple` dictionary avoids natural-language stemming and is predictable for code identifiers.
+
+### RRF Merge
+
+RRF means Reciprocal Rank Fusion.
+
+For each result:
+
+```text
+rrf_score = 1 / (K + rank_vector) + 1 / (K + rank_fts)
+K = 60
+```
+
+`rank_vector` and `rank_fts` are 1-based order positions in each branch, not cosine distance and not BM25/ts_rank values.
+
+If a result appears in only one branch, the missing branch contributes `0`.
+
+Results are deduped by:
+
+```text
+(file_path, start_line, end_line)
+```
+
+Then sorted by final RRF score.
+
+## MCP Interface
+
+Main code: `src/serving/mcp_http_server.py`.
+
+Tool:
+
+```text
+search_snippets(query, top_k, path_filter, file_extension)
+```
+
+Arguments:
+- `query`: required search text
+- `top_k`: optional; defaults to `top_k_default`
+- `path_filter`: optional substring filter over project-relative path
+- `file_extension`: optional extension filter, for example `kt`, `java`, `py`
+
+Response fields:
+- `file_path`
+- `start_line`
+- `end_line`
+- `snippet`
+- `score`
+
+## Trade-offs
+
+Strengths:
+- PostgreSQL gives one durable backend for vectors and lexical search.
+- pgvector HNSW is a better production path than an embedded local vector table.
+- CocoIndex still handles incremental source tracking and row synchronization.
+- RRF avoids manually calibrating vector distance against lexical rank values.
+
+Current limits:
+- chunking is line-window based, not AST-aware.
+- lexical search uses PostgreSQL token search, not trigram substring search.
+- query expansion/context expansion is not implemented.

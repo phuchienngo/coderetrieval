@@ -8,14 +8,14 @@ import logging
 from pathlib import Path
 import os
 import re
-import sqlite3
-from typing import TYPE_CHECKING, Annotated, Iterator
+from typing import TYPE_CHECKING, Annotated, AsyncIterator
 
+import asyncpg
 import numpy as np
 from numpy.typing import NDArray
 
 import cocoindex as coco
-from cocoindex.connectors import localfs, sqlite as coco_sqlite
+from cocoindex.connectors import localfs, postgres as coco_postgres
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.resources.file import PatternFilePathMatcher
 
@@ -23,13 +23,13 @@ from src.config import AppConfig
 from src.indexing.vectorizer import stable_chunk_id
 
 if TYPE_CHECKING:
-    from cocoindex.connectors.sqlite import TableTarget
+    from cocoindex.connectors.postgres import TableTarget
     from cocoindex.resources.file import FileLike
 
 _COCOINDEX_DB_PATH: Path | None = None
-_SQLITE_TARGET_DB_PATH: Path | None = None
+_POSTGRES_DSN: str | None = None
 _EMBEDDING_MODEL_NAME: str | None = None
-_SQLITE_DB_CTX = coco.ContextKey[coco_sqlite.ManagedConnection]("code_index_sqlite_db")
+_POSTGRES_DB_CTX = coco.ContextKey[asyncpg.Pool]("code_index_postgres_db")
 _EMBEDDER_CTX = coco.ContextKey[SentenceTransformerEmbedder]("chunk_embedder")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 logger = logging.getLogger(__name__)
@@ -55,16 +55,16 @@ class LexicalChunkRow:
 
 
 @coco.lifespan
-def _coderetrieval_coco_lifespan(builder: "coco.EnvironmentBuilder") -> Iterator[None]:
+async def _coderetrieval_coco_lifespan(builder: "coco.EnvironmentBuilder") -> AsyncIterator[None]:
     if _COCOINDEX_DB_PATH is None:
         raise RuntimeError("CocoIndex db path is not configured.")
-    if _SQLITE_TARGET_DB_PATH is None:
-        raise RuntimeError("SQLite target db path is not configured.")
+    if _POSTGRES_DSN is None:
+        raise RuntimeError("Postgres DSN is not configured.")
     if _EMBEDDING_MODEL_NAME is None:
         raise RuntimeError("Embedding model is not configured.")
     builder.settings.db_path = _COCOINDEX_DB_PATH
-    with coco_sqlite.managed_connection(_SQLITE_TARGET_DB_PATH, load_vec=True) as conn:
-        builder.provide(_SQLITE_DB_CTX, conn)
+    async with asyncpg.create_pool(_POSTGRES_DSN) as pool:
+        builder.provide(_POSTGRES_DB_CTX, pool)
         builder.provide(_EMBEDDER_CTX, SentenceTransformerEmbedder(_EMBEDDING_MODEL_NAME))
         yield
 
@@ -107,7 +107,7 @@ def _is_low_information_chunk(content: str) -> bool:
     alnum_count = sum(1 for ch in stripped if ch.isalnum())
     punct_count = sum(1 for ch in stripped if not ch.isalnum() and not ch.isspace())
 
-    if len(stripped) <= 24 and alnum_count <= 2 and punct_count >= 2:
+    if len(stripped) <= 24 and alnum_count <= 2 <= punct_count:
         return True
 
     if len(stripped) <= 80 and len(identifiers) <= 1 and punct_count > (alnum_count * 2):
@@ -187,6 +187,7 @@ class IndexingService:
             embeddings = await self._embed_chunks(embedder, filtered_chunks)
             for (start_line, end_line, content), embedding in zip(filtered_chunks, embeddings):
                 chunk_id = stable_chunk_id(rel, start_line, end_line)
+                # noinspection PyNoneFunctionAssignment
                 declare_result = vector_table.declare_row(
                     row=VectorChunkRow(
                         id=chunk_id,
@@ -196,6 +197,7 @@ class IndexingService:
                         embedding=embedding,
                     )
                 )
+                # noinspection PyNoneFunctionAssignment
                 lexical_result = lexical_table.declare_row(
                     row=LexicalChunkRow(
                         id=chunk_id,
@@ -214,19 +216,20 @@ class IndexingService:
     def _build_coco_app(self, app_name: str) -> "coco.App":
         @coco.fn
         async def app_main(project_path: Path) -> None:
-            vector_table = await coco_sqlite.mount_table_target(
-                _SQLITE_DB_CTX,
+            vector_table = await coco_postgres.mount_table_target(
+                _POSTGRES_DB_CTX,
                 "chunk_vectors",
-                await coco_sqlite.TableSchema.from_class(VectorChunkRow, primary_key=["id"]),
-                virtual_table_def=coco_sqlite.Vec0TableDef(
-                    partition_key_columns=["file_extension"],
-                    auxiliary_columns=["file_path", "content"],
-                ),
+                await coco_postgres.TableSchema.from_class(VectorChunkRow, primary_key=["id"]),
             )
-            lexical_table = await coco_sqlite.mount_table_target(
-                _SQLITE_DB_CTX,
+            vector_table.declare_vector_index(
+                column="embedding",
+                metric="cosine",
+                method="hnsw",
+            )
+            lexical_table = await coco_postgres.mount_table_target(
+                _POSTGRES_DB_CTX,
                 "chunk_lexical",
-                await coco_sqlite.TableSchema.from_class(LexicalChunkRow, primary_key=["id"]),
+                await coco_postgres.TableSchema.from_class(LexicalChunkRow, primary_key=["id"]),
             )
             files = localfs.walk_dir(
                 project_path,
@@ -254,26 +257,28 @@ class IndexingService:
         )
 
     def _configure_cocoindex_settings(self) -> None:
-        global _COCOINDEX_DB_PATH, _SQLITE_TARGET_DB_PATH, _EMBEDDING_MODEL_NAME
+        global _COCOINDEX_DB_PATH, _POSTGRES_DSN, _EMBEDDING_MODEL_NAME
         _COCOINDEX_DB_PATH = self.config.cocoindex_metadata_path
-        _SQLITE_TARGET_DB_PATH = self.config.index_data_path
+        _POSTGRES_DSN = self.config.postgres_dsn
         _EMBEDDING_MODEL_NAME = self.config.resolved_embedding_model()
         os.environ["COCOINDEX_DB"] = str(self.config.cocoindex_metadata_path)
 
     async def _ensure_fts_schema(self) -> None:
         logger.info("FTS init: checking chunk_lexical table and FTS schema.")
-        with sqlite3.connect(self.config.index_data_path) as conn:
-            table_row = conn.execute(
+        conn = await asyncpg.connect(self.config.postgres_dsn)
+        try:
+            table_row = await conn.fetchrow(
                 """
                 SELECT 1
-                FROM sqlite_master
-                WHERE type='table' AND name='chunk_lexical'
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'chunk_lexical'
                 LIMIT 1
                 """
-            ).fetchone()
+            )
             if table_row is None:
                 raise RuntimeError("chunk_lexical table is missing. Run initial indexing first.")
-            conn.execute(
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS fts_meta (
                   k TEXT PRIMARY KEY,
@@ -281,77 +286,64 @@ class IndexingService:
                 )
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors_fts
-                USING fts5(
-                  file_path,
-                  file_extension,
-                  content,
-                  tokenize='trigram'
-                )
+                ALTER TABLE chunk_lexical
+                ADD COLUMN IF NOT EXISTS content_search tsvector
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ai
-                AFTER INSERT ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
-                  VALUES (new.id, new.file_path, new.file_extension, new.content);
+                CREATE OR REPLACE FUNCTION chunk_lexical_content_search_update()
+                RETURNS trigger AS $$
+                BEGIN
+                  NEW.content_search :=
+                    to_tsvector('simple', coalesce(NEW.file_path, '') || ' ' || coalesce(NEW.content, ''));
+                  RETURN NEW;
                 END
+                $$ LANGUAGE plpgsql
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ad
-                AFTER DELETE ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, file_extension, content)
-                  VALUES('delete', old.id, old.file_path, old.file_extension, old.content);
-                END
+                DROP TRIGGER IF EXISTS chunk_lexical_content_search_tsv ON chunk_lexical
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_au
-                AFTER UPDATE ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, file_extension, content)
-                  VALUES('delete', old.id, old.file_path, old.file_extension, old.content);
-                  INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
-                  VALUES (new.id, new.file_path, new.file_extension, new.content);
-                END
+                CREATE TRIGGER chunk_lexical_content_search_tsv
+                BEFORE INSERT OR UPDATE OF file_path, content ON chunk_lexical
+                FOR EACH ROW EXECUTE FUNCTION chunk_lexical_content_search_update()
                 """
             )
-            flag_row = conn.execute(
-                "SELECT v FROM fts_meta WHERE k = 'chunk_vectors_fts_backfilled' LIMIT 1"
-            ).fetchone()
-            if flag_row is None:
-                logger.info("FTS init: seeding chunk_vectors_fts from chunk_lexical snapshot.")
-                conn.execute("DELETE FROM chunk_vectors_fts")
-                conn.execute(
-                    """
-                    INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
-                    SELECT id, file_path, file_extension, content
-                    FROM chunk_lexical
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO fts_meta(k, v)
-                    VALUES('chunk_vectors_fts_backfilled', '1')
-                    ON CONFLICT(k) DO UPDATE SET v = excluded.v
-                    """
-                )
-                logger.info("FTS init: seed completed and marked as backfilled.")
-            else:
-                logger.info("FTS init: seed already done; using existing chunk_vectors_fts.")
-            conn.commit()
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS chunk_lexical_content_search_idx
+                ON chunk_lexical USING GIN(content_search)
+                """
+            )
+            logger.info("FTS init: backfilling rows with missing content_search.")
+            result = await conn.execute(
+                """
+                UPDATE chunk_lexical
+                SET content_search =
+                  to_tsvector('simple', coalesce(file_path, '') || ' ' || coalesce(content, ''))
+                WHERE content_search IS NULL
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO fts_meta(k, v)
+                VALUES('chunk_lexical_content_search_backfilled', '1')
+                ON CONFLICT(k) DO UPDATE SET v = excluded.v
+                """
+            )
+            logger.info("FTS init: content_search backfill completed: %s.", result)
+        finally:
+            await conn.close()
 
     def _source_excluded_patterns(self) -> list[str]:
         patterns = list(self.config.exclude_globs)
-        # Never let the source walker read DB engine transient files.
-        patterns.extend(["**/*.db-journal", "**/*.db-wal", "**/*.db-shm"])
-        if self.config.index_data_path.is_relative_to(self.config.project_path):
-            patterns.append(str(self.config.index_data_path.relative_to(self.config.project_path)))
         if self.config.cocoindex_metadata_path.is_relative_to(self.config.project_path):
             rel = str(self.config.cocoindex_metadata_path.relative_to(self.config.project_path))
             patterns.append(rel)

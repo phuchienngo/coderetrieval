@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 from typing import TypedDict
+
+import psycopg
 
 from src.retrieving.service import RetrievalService
 from src.retrieving.types import SQLParam, SearchCodeResult
@@ -89,23 +90,25 @@ def _vector_search(
     except RuntimeError:
         return []
     sql = (
-        "SELECT l.file_path, l.start_line, l.end_line, l.content, v.distance "
+        "SELECT l.file_path, l.start_line, l.end_line, l.content, "
+        "(v.embedding <=> %s::vector) AS distance "
         "FROM chunk_vectors v "
         "JOIN chunk_lexical l ON l.id = v.id "
-        "WHERE v.embedding MATCH ? AND v.k = ?"
+        "WHERE true"
     )
-    args: list[SQLParam] = [query_vec, top_k]
+    args: list[SQLParam] = [query_vec]
     if path_filter:
-        sql += " AND v.file_path LIKE ?"
+        sql += " AND v.file_path LIKE %s"
         args.append(f"%{path_filter}%")
     if file_extension:
-        sql += " AND v.file_extension = ?"
+        sql += " AND v.file_extension = %s"
         args.append(file_extension.lower().lstrip("."))
-    sql += " ORDER BY v.distance"
+    sql += " ORDER BY v.embedding <=> %s::vector LIMIT %s"
+    args.extend([query_vec, top_k])
     try:
         with service._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
-    except sqlite3.Error as exc:
+    except psycopg.Error as exc:
         logger.exception("Vector search failed: %s", exc)
         return []
 
@@ -133,26 +136,26 @@ def _lexical_search(
     tokens = _tokens_for_fts(query)
     if not tokens:
         return []
-    match_expr = " OR ".join(f'"{tok}"' for tok in tokens)
+    match_expr = " | ".join(tokens)
     sql = (
-        "SELECT c.file_path, c.start_line, c.end_line, c.content, bm25(chunk_vectors_fts) AS lexical_rank "
-        "FROM chunk_vectors_fts "
-        "JOIN chunk_lexical c ON c.id = chunk_vectors_fts.rowid "
-        "WHERE chunk_vectors_fts MATCH ?"
+        "SELECT c.file_path, c.start_line, c.end_line, c.content, "
+        "ts_rank_cd(c.content_search, to_tsquery('simple', %s)) AS lexical_rank "
+        "FROM chunk_lexical c "
+        "WHERE c.content_search @@ to_tsquery('simple', %s)"
     )
-    args: list[SQLParam] = [match_expr]
+    args: list[SQLParam] = [match_expr, match_expr]
     if path_filter:
-        sql += " AND c.file_path LIKE ?"
+        sql += " AND c.file_path LIKE %s"
         args.append(f"%{path_filter}%")
     if file_extension:
-        sql += " AND c.file_extension = ?"
+        sql += " AND c.file_extension = %s"
         args.append(file_extension.lower().lstrip("."))
-    sql += " ORDER BY lexical_rank LIMIT ?"
+    sql += " ORDER BY lexical_rank DESC LIMIT %s"
     args.append(top_k)
     try:
         with service._conn() as conn:
             rows = conn.execute(sql, args).fetchall()
-    except sqlite3.Error as exc:
+    except psycopg.Error as exc:
         logger.exception("Lexical search failed: %s", exc)
         return []
 
