@@ -40,7 +40,7 @@ class VectorChunkRow:
     id: int
     file_path: str
     content: str
-    language: str
+    file_extension: str
     embedding: Annotated[NDArray[np.float32], _EMBEDDER_CTX]
 
 
@@ -51,7 +51,7 @@ class LexicalChunkRow:
     start_line: int
     end_line: int
     content: str
-    language: str
+    file_extension: str
 
 
 @coco.lifespan
@@ -180,24 +180,22 @@ class IndexingService:
             chunks = _chunk_lines(lines, self.config.chunk_size, self.config.chunk_overlap)
 
             embedder = coco.use_context(_EMBEDDER_CTX)
-            lang = file_path.suffix.lstrip(".").lower() or "text"
+            file_extension = file_path.suffix.lstrip(".").lower() or "text"
             filtered_chunks = [chunk for chunk in chunks if not _is_low_information_chunk(chunk[2])]
             if not filtered_chunks:
                 return
             embeddings = await self._embed_chunks(embedder, filtered_chunks)
             for (start_line, end_line, content), embedding in zip(filtered_chunks, embeddings):
                 chunk_id = stable_chunk_id(rel, start_line, end_line)
-                # noinspection PyNoneFunctionAssignment
                 declare_result = vector_table.declare_row(
                     row=VectorChunkRow(
                         id=chunk_id,
                         file_path=rel,
                         content=content,
-                        language=lang,
+                        file_extension=file_extension,
                         embedding=embedding,
                     )
                 )
-                # noinspection PyNoneFunctionAssignment
                 lexical_result = lexical_table.declare_row(
                     row=LexicalChunkRow(
                         id=chunk_id,
@@ -205,7 +203,7 @@ class IndexingService:
                         start_line=start_line,
                         end_line=end_line,
                         content=content,
-                        language=lang,
+                        file_extension=file_extension,
                     )
                 )
                 await self._resolve_maybe_awaitable(declare_result)
@@ -221,7 +219,7 @@ class IndexingService:
                 "chunk_vectors",
                 await coco_sqlite.TableSchema.from_class(VectorChunkRow, primary_key=["id"]),
                 virtual_table_def=coco_sqlite.Vec0TableDef(
-                    partition_key_columns=["language"],
+                    partition_key_columns=["file_extension"],
                     auxiliary_columns=["file_path", "content"],
                 ),
             )
@@ -288,7 +286,7 @@ class IndexingService:
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors_fts
                 USING fts5(
                   file_path,
-                  language,
+                  file_extension,
                   content,
                   tokenize='trigram'
                 )
@@ -298,8 +296,8 @@ class IndexingService:
                 """
                 CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ai
                 AFTER INSERT ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
-                  VALUES (new.id, new.file_path, new.language, new.content);
+                  INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
+                  VALUES (new.id, new.file_path, new.file_extension, new.content);
                 END
                 """
             )
@@ -307,8 +305,8 @@ class IndexingService:
                 """
                 CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_ad
                 AFTER DELETE ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, language, content)
-                  VALUES('delete', old.id, old.file_path, old.language, old.content);
+                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, file_extension, content)
+                  VALUES('delete', old.id, old.file_path, old.file_extension, old.content);
                 END
                 """
             )
@@ -316,10 +314,10 @@ class IndexingService:
                 """
                 CREATE TRIGGER IF NOT EXISTS chunk_lexical_fts_au
                 AFTER UPDATE ON chunk_lexical BEGIN
-                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, language, content)
-                  VALUES('delete', old.id, old.file_path, old.language, old.content);
-                  INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
-                  VALUES (new.id, new.file_path, new.language, new.content);
+                  INSERT INTO chunk_vectors_fts(chunk_vectors_fts, rowid, file_path, file_extension, content)
+                  VALUES('delete', old.id, old.file_path, old.file_extension, old.content);
+                  INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
+                  VALUES (new.id, new.file_path, new.file_extension, new.content);
                 END
                 """
             )
@@ -331,8 +329,8 @@ class IndexingService:
                 conn.execute("DELETE FROM chunk_vectors_fts")
                 conn.execute(
                     """
-                    INSERT INTO chunk_vectors_fts(rowid, file_path, language, content)
-                    SELECT id, file_path, language, content
+                    INSERT INTO chunk_vectors_fts(rowid, file_path, file_extension, content)
+                    SELECT id, file_path, file_extension, content
                     FROM chunk_lexical
                     """
                 )

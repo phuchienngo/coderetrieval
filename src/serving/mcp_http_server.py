@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Annotated
-
 from fastmcp import FastMCP
 from pydantic import Field
 
@@ -24,28 +22,27 @@ def build_mcp_server(retrieval: RetrievalService) -> FastMCP:
                 min_length=1
             ),
             top_k: int = Field(
-                1,
-                description="Maximum number of results to return. If omitted, service default is used.",
-                ge=1,
+                0,
+                description="Maximum number of results to return. If omitted, max of 1 and service default is used.",
+                ge=0,
                 le=200,
             ),
             path_filter: str = Field(
                 "",
                 description="Optional substring filter applied to file paths.",
             ),
-            language: str = Field(
+            file_extension: str = Field(
                 "",
-                description="Optional language hint/filter (for example: python, typescript).",
+                description="Optional file extension filter without dot (for example: kt, java, py).",
             ),
     ) -> dict:
-        return handle_search_snippets(
-            retrieval,
-            {
-                "query": query,
-                "top_k": top_k,
-                "path_filter": path_filter.strip() if len(path_filter.strip()) > 0 else None,
-                "language": language.strip() if len(language.strip()) else None,
-            },
-        )
+        payload = {
+            "query": query,
+            "path_filter": path_filter.strip() if len(path_filter.strip()) > 0 else None,
+            "file_extension": file_extension.strip() if len(file_extension.strip()) else None,
+        }
+        if top_k is not None:
+            payload["top_k"] = top_k
+        return handle_search_snippets(retrieval, payload)
 
     return mcp

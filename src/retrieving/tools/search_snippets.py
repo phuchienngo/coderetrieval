@@ -8,13 +8,13 @@ from src.retrieving.types import SearchCodePayload, SearchCodeResult
 def handle(service: RetrievalService, payload: SearchCodePayload) -> dict[str, list[SearchCodeResult]]:
     query = payload["query"]
     path_filter = payload.get("path_filter")
-    language = payload.get("language")
+    file_extension = payload.get("file_extension")
     return {
         "results": search_snippets(
             service,
             query=query,
             top_k=payload.get("top_k"),
             path_filter=path_filter if path_filter else None,
-            language=language if language else None,
+            file_extension=file_extension if file_extension else None,
         )
     }

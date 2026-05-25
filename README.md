@@ -8,7 +8,7 @@ Hiện tại hệ thống có 2 phần chính:
 
 ## 1. Tổng quan kiến trúc
 
-- Source of truth cho dữ liệu index: bảng `chunk_vectors` trong SQLite.
+- Dữ liệu index chính: `chunk_vectors` cho semantic/vector và `chunk_lexical` cho metadata/snippet.
 - Chỉ mục lexical: bảng FTS5 `chunk_vectors_fts`.
 - Vector search: `sqlite-vec` trên cột `embedding`.
 - Service API: MCP tool `search_snippets`.
@@ -55,18 +55,26 @@ Model lấy từ config:
 - `embedding.model`
 - nếu có `embedding.local_dir` thì resolve model local path.
 
-### 2.4. Persist vào `chunk_vectors`
+### 2.4. Persist vào `chunk_vectors` và `chunk_lexical`
 
-`chunk_vectors` được mount qua `coco_sqlite.mount_table_target(...)`.
+Hai bảng đều được mount qua `coco_sqlite.mount_table_target(...)`.
 
-`chunk_vectors` chứa:
+`chunk_vectors` là vec0 table cho semantic search:
 - `id`: stable hash từ `(file_path, start_line, end_line)`
+- `file_path`
+- `content`
+- `file_extension`
+- `embedding`
+
+`file_extension` là partition key. `file_path` và `content` là auxiliary columns trên vec table.
+
+`chunk_lexical` là table thường cho metadata và lexical search:
+- `id`
 - `file_path`
 - `start_line`
 - `end_line`
 - `content`
-- `language`
-- `embedding`
+- `file_extension`
 
 `id` ổn định giúp CocoIndex update row theo identity của chunk.
 
@@ -74,14 +82,14 @@ Model lấy từ config:
 
 Trong `IndexingService._ensure_fts_schema()`:
 - tạo `chunk_vectors_fts` (FTS5) nếu chưa có.
-- tạo 3 trigger sync tự động từ `chunk_vectors` -> `chunk_vectors_fts`:
+- tạo 3 trigger sync tự động từ `chunk_lexical` -> `chunk_vectors_fts`:
 1. `AFTER INSERT`
 2. `AFTER UPDATE`
 3. `AFTER DELETE`
 
 Ý nghĩa:
-- Khi live indexing thêm/sửa/xóa chunk trong `chunk_vectors`, chỉ mục lexical FTS5 tự cập nhật incremental.
-- Sau lần catch-up đầu tiên, hệ thống backfill snapshot từ `chunk_vectors` sang `chunk_vectors_fts` đúng 1 lần.
+- Khi live indexing thêm/sửa/xóa chunk trong `chunk_lexical`, chỉ mục lexical FTS5 tự cập nhật incremental.
+- Sau lần catch-up đầu tiên, hệ thống backfill snapshot từ `chunk_lexical` sang `chunk_vectors_fts` đúng 1 lần.
 - Sau đó không cần rebuild định kỳ; trigger lo incremental update.
 
 ## 3. Chiến lược query chi tiết
@@ -98,26 +106,27 @@ Query là hybrid gồm 2 nhánh độc lập, sau đó merge bằng RRF.
 - `WHERE embedding MATCH ? AND k = ?`
 - optional filter:
   - `file_path LIKE %path_filter%`
-  - `language = ?`
+  - `file_extension = ?`
 - sort `ORDER BY distance`
 3. Chuyển distance sang score:
 - `semantic_score = 1 / (1 + distance)`
 
 ### 3.2. Nhánh lexical (FTS5 search)
 
-1. Normalize query bằng `_normalize_for_fts(...)`:
+1. Tạo token query bằng `_tokens_for_fts(...)`:
 - tách camelCase
 - tách snake_case
 - lower-case
 - thêm token compact
-2. Build FTS expression dạng OR token.
-3. Query:
+2. Bỏ token ngắn hơn 3 ký tự vì FTS đang dùng tokenizer `trigram`.
+3. Build FTS expression dạng OR token.
+4. Query:
 - `FROM chunk_vectors_fts`
-- `JOIN chunk_vectors ON chunk_vectors.id = chunk_vectors_fts.rowid`
+- `JOIN chunk_lexical ON chunk_lexical.id = chunk_vectors_fts.rowid`
 - `WHERE chunk_vectors_fts MATCH ?`
-- optional filter theo `path_filter`, `language`
+- optional filter theo `path_filter`, `file_extension`
 - `ORDER BY bm25(chunk_vectors_fts)`
-4. Đổi rank lexical thành điểm đơn điệu theo vị trí:
+5. Đổi rank lexical thành điểm đơn điệu theo vị trí:
 - `lexical_rank_score = 1 / (1 + rank_index)`
 
 ### 3.3. Merge semantic + lexical bằng RRF
@@ -145,7 +154,7 @@ Lợi ích RRF so với weighted score thô:
 Mã: `src/serving/mcp_http_server.py`
 
 Hiện chỉ expose 1 tool:
-- `search_snippets(query, top_k, path_filter, language)`
+- `search_snippets(query, top_k, path_filter, file_extension)`
 
 Response:
 - danh sách snippet gồm:

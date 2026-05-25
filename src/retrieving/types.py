@@ -17,4 +17,4 @@ class SearchCodePayload(TypedDict):
     query: str
     top_k: NotRequired[int]
     path_filter: NotRequired[str]
-    language: NotRequired[str]
+    file_extension: NotRequired[str]

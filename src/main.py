@@ -24,7 +24,7 @@ def run() -> None:
     mcp = build_mcp_server(RetrievalService(config))
     try:
         logging.info("Startup: MCP server ready for queries at http://%s:%s/mcp", config.host, config.port)
-        mcp.run(transport="streamable-http", host=config.host, port=config.port, path="/mcp")
+        mcp.run(transport="streamable-http", host=config.host, port=config.port, path="/mcp",show_banner=False)
     finally:
         scheduler.stop()
 

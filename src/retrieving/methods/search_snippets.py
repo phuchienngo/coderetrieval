@@ -26,7 +26,7 @@ class _ScoredRow(TypedDict):
 _RRF_K = 60.0
 
 
-def _normalize_for_fts(text: str) -> str:
+def _tokens_for_fts(text: str) -> list[str]:
     out: list[str] = []
     for raw in _TOKEN_RE.findall(text):
         token = raw.strip()
@@ -38,7 +38,14 @@ def _normalize_for_fts(text: str) -> str:
         compact = _NON_WORD_RE.sub("", token.lower())
         if compact and compact not in parts:
             out.append(compact)
-    return " ".join(out)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in out:
+        if len(token) < 3 or token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
 
 
 def search_snippets(
@@ -46,22 +53,22 @@ def search_snippets(
     query: str,
     top_k: int | None = None,
     path_filter: str | None = None,
-    language: str | None = None,
+    file_extension: str | None = None,
 ) -> list[SearchCodeResult]:
-    effective_top_k = top_k or service.config.top_k_default
+    effective_top_k = max(1, top_k or service.config.top_k_default)
     semantic_rows = _vector_search(
         service=service,
         query=query,
         top_k=max(effective_top_k * 3, 20),
         path_filter=path_filter,
-        language=language,
+        file_extension=file_extension,
     )
     lexical_rows = _lexical_search(
         service=service,
         query=query,
         top_k=max(effective_top_k * 3, 20),
         path_filter=path_filter,
-        language=language,
+        file_extension=file_extension,
     )
     return _merge_ranked(
         top_k=effective_top_k,
@@ -75,7 +82,7 @@ def _vector_search(
     query: str,
     top_k: int,
     path_filter: str | None,
-    language: str | None,
+    file_extension: str | None,
 ) -> list[SearchCodeResult]:
     try:
         query_vec = service.embed_query_literal(query)
@@ -89,11 +96,11 @@ def _vector_search(
     )
     args: list[SQLParam] = [query_vec, top_k]
     if path_filter:
-        sql += " AND l.file_path LIKE ?"
+        sql += " AND v.file_path LIKE ?"
         args.append(f"%{path_filter}%")
-    if language:
-        sql += " AND l.language = ?"
-        args.append(language.lower())
+    if file_extension:
+        sql += " AND v.file_extension = ?"
+        args.append(file_extension.lower().lstrip("."))
     sql += " ORDER BY v.distance"
     try:
         with service._conn() as conn:
@@ -119,11 +126,11 @@ def _lexical_search(
     query: str,
     top_k: int,
     path_filter: str | None,
-    language: str | None,
+    file_extension: str | None,
 ) -> list[SearchCodeResult]:
     if not query.strip():
         return []
-    tokens = [t for t in _normalize_for_fts(query).split() if t]
+    tokens = _tokens_for_fts(query)
     if not tokens:
         return []
     match_expr = " OR ".join(f'"{tok}"' for tok in tokens)
@@ -137,9 +144,9 @@ def _lexical_search(
     if path_filter:
         sql += " AND c.file_path LIKE ?"
         args.append(f"%{path_filter}%")
-    if language:
-        sql += " AND c.language = ?"
-        args.append(language.lower())
+    if file_extension:
+        sql += " AND c.file_extension = ?"
+        args.append(file_extension.lower().lstrip("."))
     sql += " ORDER BY lexical_rank LIMIT ?"
     args.append(top_k)
     try:
